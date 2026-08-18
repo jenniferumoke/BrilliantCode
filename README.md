@@ -1,4 +1,5 @@
 
+
 ### BrilliantCode - Your open source AI engineer
 
 [![BrilliantCode](assets/brilliant-code-image.png)](https://jcumoke.com/bcode)
@@ -12,7 +13,7 @@ BrilliantCode is an open-source agentic IDE that enables frontier models (includ
 
 2. Use your ChatGPT subscription OR add your API Keys.
 
-	1. Go to AI -> Sign in with ChatGPT
+	1. Go to AI -> Sign in with ChatGPT. The Codex CLI (`codex`) must be installed and on your `PATH`.
 	![Sign in with ChatGPT](assets/sign-in-with-chatgpt-in-bcode.png)
 
 	2.  Add an API key
