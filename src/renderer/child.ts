@@ -2415,7 +2415,11 @@ async function loadDir(dir: string, silent = false, opts: { setActiveDir?: boole
     loadingDirs.delete(target);
     if (updateActiveDir && codeFileList) {
       const message = error instanceof Error ? error.message : String(error);
-      codeFileList.innerHTML = `<div class="code-item code-error">${message || 'File browser unavailable'}</div>`;
+      // Error text can include file paths from the workspace; never parse it as HTML.
+      const errorEl = document.createElement('div');
+      errorEl.className = 'code-item code-error';
+      errorEl.textContent = message || 'File browser unavailable';
+      codeFileList.replaceChildren(errorEl);
     }
   } finally {
     if (shouldRender && (!hadError || !updateActiveDir)) {

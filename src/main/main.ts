@@ -28,6 +28,7 @@ import { promises as fs } from 'node:fs';
 import * as fsSync from 'node:fs';
 import * as dotenv from 'dotenv';
 import { McpHost, normalizeServerConfig } from './mcpHost.js';
+import { installGlobalWebContentsGuards, lockDownPrivilegedContents, safeOpenExternal, safeOpenPath } from './security.js';
 import * as apiKeys from '../services/api-keys.js';
 import * as versionCheck from '../services/version-check.js';
 import { setupAutoUpdater, checkForUpdates as checkAutoUpdates } from '../services/auto-updater.js';
@@ -379,6 +380,36 @@ const preloadPath = (() => {
 
 // Global MCP host manager (holds per-window state internally)
 const mcpHost = new McpHost();
+// Workspace-defined MCP servers (package.json "mcpServers") run a command from
+// whatever repo is open. Show the exact command and require an explicit yes.
+mcpHost.setWorkspaceServerApprover(async (req, win) => {
+  const quote = (v: string) => (/^[\w@%+=:,./-]+$/.test(v) ? v : JSON.stringify(v));
+  const commandLine = [req.command, ...req.args].map(quote).join(' ');
+  const detail = [
+    `This MCP server is defined in the open workspace's package.json, not in your own settings. Connecting will run:`,
+    '',
+    commandLine,
+    '',
+    `Working directory: ${req.cwd}`,
+    req.envKeys.length ? `Extra environment variables: ${req.envKeys.join(', ')}` : '',
+    '',
+    'Only continue if you trust this repository.',
+  ].filter((line, i, arr) => line !== '' || (arr[i - 1] ?? '') !== '').join('\n');
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    buttons: ['Cancel', 'Run server'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'Run workspace MCP server?',
+    message: `Run the MCP server "${req.name}" from this workspace?`,
+    detail,
+  };
+  const result = win && !win.isDestroyed()
+    ? await dialog.showMessageBox(win, options)
+    : await dialog.showMessageBox(options);
+  return result.response === 1;
+});
 const chatStore = new ChatStore();
 const agentSessionManager = new AgentSessionManager(chatStore);
 
@@ -435,6 +466,17 @@ type LayoutMode = 'split' | 'agent' | 'browser';
 const windowLayoutModes = new Map<number, LayoutMode>();
 let lastFocusedWindowId: number | null = null;
 let menuLayoutMode: LayoutMode = 'split';
+
+// Security: deny window.open from app windows (popups would inherit our
+// preload), lock down <webview> attachment, and open webview popups as a new
+// preview tab instead of a new BrowserWindow. See src/main/security.ts.
+installGlobalWebContentsGuards((guest, url) => {
+  const host = guest.hostWebContents;
+  if (!host) return;
+  const { win } = resolveWindowForSender(host);
+  if (!win) return;
+  void sendPreviewCommand(win, { action: 'navigate', params: { url, focus: true, openNewTab: true } }).catch(() => {});
+});
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
@@ -1388,7 +1430,7 @@ ipcMain.handle('openai-oauth:start', async () => {
     // Open the browser
     let browserOpened = true;
     try {
-      await shell.openExternal(loginResult.authUrl);
+      await safeOpenExternal(loginResult.authUrl);
     } catch (openErr: any) {
       browserOpened = false;
     }
@@ -1450,8 +1492,7 @@ ipcMain.handle('version:current', async () => {
 ipcMain.handle('version:openDownload', async (_event: Electron.IpcMainInvokeEvent, url: string) => {
   try {
     if (!url) return { ok: false, error: 'No URL provided' };
-    await shell.openExternal(url);
-    return { ok: true };
+    return await safeOpenExternal(url);
   } catch (error: any) {
     return { ok: false, error: error?.message || 'Failed to open download link' };
   }
@@ -1623,9 +1664,11 @@ async function createWelcomeWindow(): Promise<Electron.BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false,
-      sandbox: false,
+      sandbox: true,
     }
   });
+
+  lockDownPrivilegedContents(win.webContents);
 
   win.on('closed', () => {
     if (welcomeWindow === win) {
@@ -1719,7 +1762,11 @@ async function previewPathInView(win: Electron.BrowserWindow, filePath: string):
     const resolved = safePath.abs;
     if (!fsSync.existsSync(resolved)) return { ok: false, error: 'not-found' };
     const ext = path.extname(resolved).toLowerCase();
-    if (['.html', '.htm'].includes(ext)) {
+    // HTML, SVG, PDF and images open in a separate sandboxed window with no
+    // preload. They must never be loaded into the child view itself: that
+    // view carries our preload (terminal, file APIs), and an SVG or HTML file
+    // from an untrusted repo could run script there.
+    if (['.html', '.htm', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.pdf'].includes(ext)) {
       const preview = new BrowserWindow({
         width: 960,
         height: 720,
@@ -1734,6 +1781,8 @@ async function previewPathInView(win: Electron.BrowserWindow, filePath: string):
           webSecurity: true,
           allowRunningInsecureContent: false,
           webviewTag: false,
+          // PDFs need the built-in viewer plugin.
+          plugins: ext === '.pdf',
         }
       });
       htmlPreviewWindows.add(preview);
@@ -1742,10 +1791,6 @@ async function previewPathInView(win: Electron.BrowserWindow, filePath: string):
       });
       preview.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
       await preview.loadFile(resolved);
-      return { ok: true };
-    }
-    if (['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.pdf'].includes(ext)) {
-      await view.webContents.loadURL(pathToFileURL(resolved).toString());
       return { ok: true };
     }
     // Text-like fallback (pretty-print JSON)
@@ -1759,8 +1804,9 @@ async function previewPathInView(win: Electron.BrowserWindow, filePath: string):
       bodyText = raw;
     }
     const safe = escapeHtml(bodyText);
-    const title = path.basename(resolved);
-    const html = `<!doctype html><meta charset="utf-8"><title>${title}</title><style>html,body{height:100%;margin:0;background:#111;color:#eee;font:13px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px} pre{white-space:pre-wrap;word-break:break-word}</style><pre>${safe}</pre>`;
+    // File names are attacker-controlled in an untrusted repo; escape them too.
+    const title = escapeHtml(path.basename(resolved)).replace(/"/g, '&quot;');
+    const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>${title}</title><style>html,body{height:100%;margin:0;background:#111;color:#eee;font:13px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px} pre{white-space:pre-wrap;word-break:break-word}</style><pre>${safe}</pre>`;
     await view.webContents.loadURL('data:text/html;base64,' + Buffer.from(html).toString('base64'));
     return { ok: true };
   } catch (e) {
@@ -1808,6 +1854,8 @@ async function createWindow() {
       backgroundThrottling: false
     }
   });
+
+  lockDownPrivilegedContents(win.webContents);
 
   // Load renderer via Vite dev server if configured, otherwise from dist/src
   try {
@@ -1863,6 +1911,7 @@ async function createWindow() {
     childWindow.webContents.loadURL('data:text/html;base64,' + Buffer.from(html).toString('base64'));
   }
 
+  lockDownPrivilegedContents(childWindow.webContents);
   win.contentView.addChildView(childWindow);
   childViews.set(win.id, childWindow);
   // Initialize per-window working dir
@@ -2391,11 +2440,8 @@ ipcMain.handle('child:open-external', async (event: Electron.IpcMainInvokeEvent,
     const roots = win ? getAllowedRootsForWindow(win.id) : { workspaceRoot: cwd, additionalRoot: null, allowExternal: false };
     const safe = resolvePathInAllowedRoots(roots, payload.path, { intent: 'write' });
     if (!safe.ok || !safe.abs) return { ok: false, error: safe.error };
-    const result = await shell.openPath(safe.abs);
-    if (typeof result === 'string' && result.trim()) {
-      return { ok: false, error: result.trim() };
-    }
-    return { ok: true };
+    // Never execute programs/scripts from the workspace; reveal them instead.
+    return await safeOpenPath(safe.abs);
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
@@ -4204,6 +4250,7 @@ function showAddMcpServerDialog(parent?: Electron.BrowserWindow | null): void {
     webPreferences: { contextIsolation: true, nodeIntegration: false, preload }
   });
   win.once('ready-to-show', () => win.show());
+  lockDownPrivilegedContents(win.webContents);
   const html = `<!doctype html>
   <meta charset="utf-8">
   <title>Add MCP Server</title>
@@ -4331,6 +4378,7 @@ function showApiKeysDialog(parent?: Electron.BrowserWindow | null): void {
     webPreferences: { contextIsolation: true, nodeIntegration: false, preload }
   });
   win.once('ready-to-show', () => win.show());
+  lockDownPrivilegedContents(win.webContents);
 
   const html = `<!doctype html>
   <meta charset="utf-8">
@@ -4772,7 +4820,7 @@ async function startChatGPTSignInFromMenu(): Promise<void> {
     }
     const loginResult = await codexClient.startChatGPTLogin();
     try {
-      await shell.openExternal(loginResult.authUrl);
+      await safeOpenExternal(loginResult.authUrl);
     } catch {
       dialog.showErrorBox('ChatGPT Sign-in', `Please open this URL to sign in:\n\n${loginResult.authUrl}`);
     }

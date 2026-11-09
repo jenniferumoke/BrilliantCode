@@ -177,8 +177,13 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 export function openDownloadLink(url: string): void {
   console.log('[version-check] Opening download link:', url);
   if (!url) return;
+  // The URL comes from the remote version manifest; only ever open web links.
+  if (!/^https:\/\//i.test(url.trim())) {
+    console.error('[version-check] Refusing to open non-https download link');
+    return;
+  }
   try {
-    void shell.openExternal(url);
+    void shell.openExternal(url.trim());
   } catch (error: any) {
     console.error('[version-check] Failed to open download link:', error?.message);
   }
