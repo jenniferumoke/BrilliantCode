@@ -34,43 +34,22 @@ BrilliantCode is an open-source autonomous AI engineer built for production-grad
 
 ## Installation
 
-### Download Pre-built Binaries
+BrilliantCode is distributed as source code only. There are no pre-built downloads. Build it on your own machine by following [Building from source in the README](README.md#building-from-source), which covers prerequisites for each platform, running from source, and packaging a desktop app.
 
-Visit [https://brilliantai.co/download](https://jcumoke.com/bcode) to download builds for macOS, Windows, and Linux.
-
-### Building from Source
-
-**Prerequisites:**
-- Node.js 20+
-- Native build tooling for Node modules (Xcode CLT on macOS, Windows Build Tools on Windows)
+Short version, if you already have Node.js 20+ and a C/C++ toolchain:
 
 ```bash
-# Clone the repository
-git clone https://github.com/brilliantai/brilliantcode.git
-cd brilliantcode
-
-# Install dependencies
-npm install
-
-# Run in development mode
-npm run dev
+git clone https://github.com/jenniferumoke/BrilliantCode.git
+cd BrilliantCode
+npm ci
+npm run rebuild    # compile native modules (node-pty, keytar) for Electron
+npm run run:dist   # build and launch
 ```
 
-This starts:
+For development with hot reload, run `npm run dev`. This starts:
 - Vite renderer dev server on `http://localhost:5174`
 - TypeScript watchers for `src/main` and `src/preload`
 - Electron app pointed at the dev server
-
-**Production Build:**
-```bash
-npm run build
-```
-
-**Packaging:**
-```bash
-npm run build
-npx electron-forge make
-```
 
 ### API Keys
 
