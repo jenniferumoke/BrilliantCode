@@ -40,7 +40,22 @@ type WindowState = {
   workingDir: string;
   servers: Map<string, ConnectedServer>;
   config: McpConfig;
+  // Servers whose effective config came from the workspace (package.json),
+  // i.e. from whatever repository is open rather than from the user.
+  workspaceNames: Set<string>;
 };
+
+export type WorkspaceServerApprovalRequest = {
+  winId: number;
+  name: string;
+  workingDir: string;
+  command: string;
+  args: string[];
+  cwd: string;
+  envKeys: string[];
+};
+
+export type WorkspaceServerApprover = (req: WorkspaceServerApprovalRequest, win?: BrowserWindow) => Promise<boolean>;
 
 // Utility: safe read JSON file
 function readJson(file: string): any | null {
@@ -97,13 +112,14 @@ function mergeConfigSource(target: McpConfig, source: any): void {
 }
 
 // Load MCP config from workspace (package.json -> mcpServers) and user (~/.brilliantcode/mcp.json)
-function loadMcpConfig(workingDir: string): McpConfig {
+function loadMcpConfig(workingDir: string): { config: McpConfig; workspaceNames: Set<string> } {
   const merged: McpConfig = {};
   try {
     const pkgPath = path.join(workingDir, 'package.json');
     const pkg = readJson(pkgPath);
     mergeConfigSource(merged, pkg);
   } catch {}
+  const workspaceConfig: McpConfig = { ...merged };
   try {
     const home = process.env.HOME || process.env.USERPROFILE || '';
     if (home) {
@@ -112,7 +128,12 @@ function loadMcpConfig(workingDir: string): McpConfig {
       mergeConfigSource(merged, userCfg);
     }
   } catch {}
-  return merged;
+  // A name counts as workspace-sourced only if the user config did not
+  // replace it with its own definition.
+  const workspaceNames = new Set<string>(
+    Object.keys(workspaceConfig).filter((name) => merged[name] === workspaceConfig[name])
+  );
+  return { config: merged, workspaceNames };
 }
 
 // Attempt to require the official MCP client + stdio transport at runtime.
@@ -195,12 +216,24 @@ function loadMcpLibraries(): {
 
 export class McpHost {
   private windows = new Map<number, WindowState>();
+  private workspaceApprover: WorkspaceServerApprover | null = null;
+  private approvedWorkspaceServers = new Set<string>();
+
+  /**
+   * Opening a repository must not be enough to run code from it. Servers
+   * defined in a workspace's package.json are only spawned after this
+   * approver (a dialog showing the exact command) says yes. Without an
+   * approver, workspace servers are refused.
+   */
+  setWorkspaceServerApprover(fn: WorkspaceServerApprover | null): void {
+    this.workspaceApprover = fn;
+  }
 
   async prepare(winId: number, workingDir: string): Promise<void> {
     const dir = path.resolve(workingDir || process.cwd());
     let st = this.windows.get(winId);
     if (!st) {
-      st = { workingDir: dir, servers: new Map(), config: {} };
+      st = { workingDir: dir, servers: new Map(), config: {}, workspaceNames: new Set() };
       this.windows.set(winId, st);
     }
     if (st.workingDir !== dir) {
@@ -208,7 +241,9 @@ export class McpHost {
       await this.stopAllInternal(st);
       st.workingDir = dir;
     }
-    st.config = loadMcpConfig(dir);
+    const loaded = loadMcpConfig(dir);
+    st.config = loaded.config;
+    st.workspaceNames = loaded.workspaceNames;
   }
 
   getStatus(winId: number): { workingDir: string; servers: { name: string; status: string; error?: string; tools?: number }[]; config: McpConfig } {
@@ -246,6 +281,30 @@ export class McpHost {
     if (!cfg || !cfg.command) return { ok: false, error: 'not-configured' };
 
     if (st.servers.has(name)) return { ok: true }; // already connected
+
+    if (st.workspaceNames.has(name)) {
+      const cwdForApproval = path.resolve(st.workingDir, cfg.cwd || '.');
+      const approvalKey = JSON.stringify([st.workingDir, name, cfg.command, cfg.args || [], cwdForApproval, cfg.env || {}]);
+      if (!this.approvedWorkspaceServers.has(approvalKey)) {
+        if (!this.workspaceApprover) return { ok: false, error: 'Workspace MCP servers require approval.' };
+        let approved = false;
+        try {
+          approved = await this.workspaceApprover({
+            winId,
+            name,
+            workingDir: st.workingDir,
+            command: cfg.command,
+            args: Array.isArray(cfg.args) ? cfg.args : [],
+            cwd: cwdForApproval,
+            envKeys: Object.keys(cfg.env || {}),
+          }, win);
+        } catch {
+          approved = false;
+        }
+        if (!approved) return { ok: false, error: 'Connection cancelled: workspace MCP server was not approved.' };
+        this.approvedWorkspaceServers.add(approvalKey);
+      }
+    }
 
     const libs = loadMcpLibraries();
     if (!libs.ok) return { ok: false, error: libs.error || 'mcp-client-not-installed' };

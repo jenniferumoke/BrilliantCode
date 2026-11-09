@@ -5932,7 +5932,11 @@ function setupAiInput(): void {
             if (name === 'terminal_input') {
               const t = p?.text ?? '';
               const terminalId = p?.terminal_id ? String(p.terminal_id) : 'default';
-              return `Write to terminal [${terminalId}]${p?.newline ? ' (with newline)' : ''}:\n${t}`;
+              const reasons = Array.isArray(p?.riskReasons) ? p.riskReasons.filter((r: unknown) => typeof r === 'string') : [];
+              const warning = reasons.length
+                ? `⚠ High-risk command (${reasons.join('; ')}). Only approve if you asked for this.\n\n`
+                : '';
+              return `${warning}Write to terminal [${terminalId}]${p?.newline ? ' (with newline)' : ''}:\n${t}`;
             }
           } catch { }
           // Fallback to raw arguments
